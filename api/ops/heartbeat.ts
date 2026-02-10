@@ -1,11 +1,192 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.SUPABASE_URL!;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY!;
-
-const sb = createClient(supabaseUrl, supabaseKey);
+const sb = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
 
 const STALE_THRESHOLD_MS = 30 * 60 * 1000;
+
+// ==================== PROPOSAL SERVICE ====================
+
+async function createProposal(source: string, step_kind: string, description: string, payload?: any) {
+  // 1. Cap Gates
+  const gateResult = await checkCapGate(step_kind);
+  if (!gateResult.ok) {
+    // Rechazar propuesta
+    const { data: proposal } = await sb
+      .from('ops_mission_proposals')
+      .insert({
+        source,
+        step_kind,
+        description,
+        status: 'rejected',
+        reason: gateResult.reason
+      })
+      .select()
+      .single();
+    return { proposal, approved: false };
+  }
+
+  // 2. Insert proposal (approved immediately)
+  const { data: proposal } = await sb
+    .from('ops_mission_proposals')
+    .insert({
+      source,
+      step_kind,
+      description,
+      status: 'approved'
+    })
+    .select()
+    .single();
+
+  // 3. Auto-approve check (enabled by default for all kinds)
+  const autoApprove = await checkAutoApprove(step_kind);
+  if (autoApprove) {
+    // Crear misión y step
+    const { data: mission } = await sb
+      .from('ops_missions')
+      .insert({ proposal_id: proposal.id, status: 'approved' })
+      .select()
+      .single();
+
+    await sb.from('ops_mission_steps').insert({
+      mission_id: mission.id,
+      step_kind,
+      status: 'queued',
+      payload: payload || {}
+    });
+
+    return { proposal, mission, approved: true };
+  }
+
+  return { proposal, approved: false };
+}
+
+async function checkCapGate(step_kind: string) {
+  const gates: Record<string, (sb: any) => Promise<{ ok: boolean; reason?: string }>> = {
+    write_content: checkWriteContentGate,
+    post_tweet: checkPostTweetGate,
+    deploy: checkDeployGate,
+    generate_website: checkGenerateWebsiteGate,
+    audit_site: checkAuditSiteGate,
+    deploy_site: checkDeploySiteGate,
+    send_client_email: checkSendEmailGate
+  };
+
+  const gate = gates[step_kind];
+  if (!gate) return { ok: true };
+  return await gate(sb);
+}
+
+async function checkWriteContentGate(sb: any) {
+  const policy = await getPolicy('x_daily_content_limit');
+  const limit = Number(policy?.limit ?? 10);
+  const { count } = await sb
+    .from('ops_mission_steps')
+    .select('id', { count: 'exact', head: true })
+    .eq('step_kind', 'write_content')
+    .eq('status', 'succeeded')
+    .gte('completed_at', startOfTodayUtcIso());
+
+  if ((count ?? 0) >= limit) {
+    return { ok: false, reason: `Daily content limit reached (${count}/${limit})` };
+  }
+  return { ok: true };
+}
+
+async function checkPostTweetGate(sb: any) {
+  const autopost = await getPolicy('x_autopost');
+  if (autopost?.enabled === false) {
+    return { ok: false, reason: 'x_autopost disabled' };
+  }
+  const quota = await getPolicy('x_daily_quota');
+  const limit = Number(quota?.limit ?? 10);
+  const { count } = await sb
+    .from('ops_mission_steps')
+    .select('id', { count: 'exact', head: true })
+    .eq('step_kind', 'post_tweet')
+    .eq('status', 'succeeded')
+    .gte('completed_at', startOfTodayUtcIso());
+
+  if ((count ?? 0) >= limit) {
+    return { ok: false, reason: `Daily tweet quota reached (${count}/${limit})` };
+  }
+  return { ok: true };
+}
+
+async function checkDeployGate(sb: any) {
+  const policy = await getPolicy('x_deploy_window');
+  if (policy?.enabled === false) {
+    return { ok: false, reason: 'x_deploy_window disabled' };
+  }
+  const now = new Date();
+  const hour = now.getUTCHours();
+  if (hour < 8 || hour >= 20) {
+    return { ok: false, reason: 'Deploy only allowed 8:00-20:00 UTC' };
+  }
+  return { ok: true };
+}
+
+async function checkGenerateWebsiteGate(sb: any) {
+  const policy = await getPolicy('x_daily_gen_limit');
+  const limit = Number(policy?.limit ?? 20);
+  const { count } = await sb
+    .from('ops_mission_steps')
+    .select('id', { count: 'exact', head: true })
+    .eq('step_kind', 'generate_website')
+    .eq('status', 'succeeded')
+    .gte('completed_at', startOfTodayUtcIso());
+
+  if ((count ?? 0) >= limit) {
+    return { ok: false, reason: `Daily generation limit reached (${count}/${limit})` };
+  }
+  return { ok: true };
+}
+
+async function checkAuditSiteGate(sb: any) {
+  return { ok: true };
+}
+
+async function checkDeploySiteGate(sb: any) {
+  return checkDeployGate(sb);
+}
+
+async function checkSendEmailGate(sb: any) {
+  const policy = await getPolicy('x_daily_email_limit');
+  const limit = Number(policy?.limit ?? 50);
+  const { count } = await sb
+    .from('ops_mission_steps')
+    .select('id', { count: 'exact', head: true })
+    .eq('step_kind', 'send_client_email')
+    .eq('status', 'succeeded')
+    .gte('completed_at', startOfTodayUtcIso());
+
+  if ((count ?? 0) >= limit) {
+    return { ok: false, reason: `Daily email limit reached (${count}/${limit})` };
+  }
+  return { ok: true };
+}
+
+async function checkAutoApprove(step_kind: string): Promise<boolean> {
+  const policy = await getPolicy('auto_approve');
+  if (!policy?.enabled) return false;
+  const allowed = policy.allowed_step_kinds as string[] || [];
+  if (policy.allowed_step_kinds === undefined || policy.allowed_step_kinds.length === 0) {
+    return step_kind !== 'deploy_site' && step_kind !== 'deploy';
+  }
+  return allowed.includes(step_kind);
+}
+
+async function getPolicy(id: string) {
+  const { data } = await sb.from('ops_policy').select('value').eq('id', id).single();
+  return data?.value || null;
+}
+
+function startOfTodayUtcIso() {
+  const now = new Date();
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return new Date(start).toISOString();
+}
+
+// ==================== HEARTBEAT ====================
 
 async function evaluateTriggers() {
   const { data: rules } = await sb
@@ -17,9 +198,13 @@ async function evaluateTriggers() {
 
   let firedCount = 0;
   for (const rule of rules) {
-    const conditionMet = await checkCondition(rule);
-    if (conditionMet) {
-      await createProposalFromRule(rule);
+    if (await checkCondition(rule)) {
+      await createProposal('trigger', rule.type, `Trigger: ${rule.name}`, {
+        rule_id: rule.id,
+        source: rule.source,
+        target: rule.target,
+        probability: rule.probability
+      });
       firedCount++;
     }
   }
@@ -27,21 +212,10 @@ async function evaluateTriggers() {
 }
 
 async function checkCondition(rule: any): Promise<boolean> {
-  return Math.random() > 0.7;
-}
-
-async function createProposalFromRule(rule: any) {
-  await sb.from('ops_agent_events').insert({
-    agent_id: rule.target,
-    event_type: 'proposal_created',
-    payload: {
-      source: 'trigger',
-      rule_id: rule.id,
-      step_kind: rule.type,
-      description: `Triggered by ${rule.source}`
-    },
-    created_at: new Date().toISOString()
-  });
+  if (rule.probability !== undefined) {
+    return Math.random() < rule.probability;
+  }
+  return false;
 }
 
 async function processReactionQueue() {
@@ -109,6 +283,8 @@ async function maybeFinalizeMissionIfDone(missionId: string) {
       .eq('id', missionId);
   }
 }
+
+// ==================== EXPORT ====================
 
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
